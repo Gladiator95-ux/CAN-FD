@@ -1,0 +1,1356 @@
+#include "candbc.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <errno.h>
+
+#ifndef array_length
+#define array_length(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
+// Constants
+#define DBC_SIGNAL_MOTOROLA 0x01
+#define DBC_SIGNAL_INTEL    0x00
+#define DBC_SIGNAL_UNSIGNED 0x02
+#define DBC_SIGNAL_SIGNED   0x00
+#define DBC_SIGNAL_JUST_BIT 0x04
+
+#define DBC_FILE_TYPE_GENERAL 0
+#define DBC_FILE_TYPE_J1939   1
+
+#define MAX_SIGNAL 127
+
+// Global variables
+int can_proto_handle = -1;
+hf_register_info* can_dynamic_hf = NULL;
+struct can_ett ett;
+module_t* pref_dbc_file_module = NULL;
+
+static GHashTable* dbc_msg_ids = NULL;
+static GArray* loaded_dbc_files = NULL;
+static uat_t* dbc_files_uat = NULL;
+
+static struct dbc_files_uat_data* dbc_files_uat_data = NULL;
+static guint num_dbc_files_uat_data = 0;
+
+int proto_dbc = -1;
+int ett_dbc = -1;
+
+int hf_dbc_module_name = -1;
+int hf_dbc_frame_num = -1;
+int hf_dbc_message_id = -1;
+int hf_dbc_message_orig_id = -1;
+int hf_dbc_message_name = -1;
+int hf_dbc_message_comment = -1;
+
+int hf_dbc_signal_name[MAX_SIGNAL];
+int hf_dbc_signal_comment[MAX_SIGNAL];
+int hf_dbc_signal_val[MAX_SIGNAL];
+int hf_dbc_signal_val_min[MAX_SIGNAL];
+int hf_dbc_signal_val_max[MAX_SIGNAL];
+int hf_dbc_signal_unit[MAX_SIGNAL];
+
+expert_field ei_dbc_signal_max = EI_INIT;
+expert_field ei_dbc_signal_min = EI_INIT;
+
+// Structures
+struct can_identifier
+{
+    guint32 id;
+};
+
+struct dbc_file
+{
+    char* path;
+    guint ftype;
+};
+
+struct dbc_signal
+{
+    struct dbc_signal* next;
+    char* name;
+    char* comment;
+    guint8 bit_start;
+    guint8 bit_length;
+    guint8 flags;
+    double factor;
+    double offset;
+    double min_value;
+    double max_value;
+    char* unit;
+    value_string* vals;
+    int hf_id;
+    int ett_id;
+};
+
+struct dbc_message
+{
+    const struct dbc_file* file;
+    guint32 orig_id;
+    guint32 id;
+    char* name;
+    char* comment;
+    int hf_id;
+    int ett_id;
+    struct dbc_signal* signals;
+    guint signal_count;
+};
+
+struct dbc_context
+{
+    const struct dbc_file* file;
+    FILE* fp;
+    char buf[4096];
+    guint32 msg_id_mask;
+    struct dbc_message* current_msg;
+};
+
+struct dbc_files_uat_data
+{
+    char* filename;
+    char* channel_name;
+    guint ftype;
+    gboolean enabled;
+};
+
+struct dbc_file_entry
+{
+    struct dbc_file* file;
+    char* display_name;
+    int proto_handle;
+    dissector_handle_t dissector_handle;
+};
+
+static const value_string dbc_files_type_vals[] =
+{
+    { DBC_FILE_TYPE_GENERAL, "General" },
+    { DBC_FILE_TYPE_J1939, "J1939 (CAN ID masked 0x03FFFF00)" },
+    { 0, NULL }
+};
+
+// Forward declarations
+static void dbc_files_uat_initialize_cb(void);
+static int dbc_read_file(const char* path, int ftype, guint32 mask);
+
+// Parser functions
+static size_t dbc_skip_sepa(const char** pmsg)
+{
+    const char* msg = *pmsg;
+    size_t pos = 0;
+    while (g_ascii_isspace(msg[pos]))
+        pos++;
+    *pmsg = &(msg[pos]);
+    return pos;
+}
+
+static gboolean dbc_skip_char(const char** pmsg, char ch)
+{
+    const char* msg = *pmsg;
+    gboolean ret = FALSE;
+    if (*msg == ch)
+    {
+        msg++;
+        ret = TRUE;
+    }
+    *pmsg = msg;
+    return ret;
+}
+
+static char* dbc_parse_str(const char** pmsg)
+{
+    GString* str = NULL;
+    const char* msg = *pmsg;
+    size_t pos = 0;
+
+    if (msg[pos] != '"')
+        return NULL;
+
+    pos++;
+    str = g_string_new("");
+
+    while (msg[pos] && msg[pos] != '"')
+    {
+        g_string_append_c(str, msg[pos]);
+        pos++;
+    }
+
+    if (msg[pos] != '"')
+    {
+        g_string_free(str, TRUE);
+        return NULL;
+    }
+
+    *pmsg = &(msg[pos + 1]);
+    return g_string_free(str, FALSE);
+}
+
+static char* dbc_parse_name(const char** pmsg)
+{
+    const char* msg = *pmsg;
+    size_t pos = 0;
+
+    if (!g_ascii_isalpha(msg[pos]) && msg[pos] != '_')
+        return NULL;
+    pos++;
+
+    while (g_ascii_isalnum(msg[pos]) || msg[pos] == '_')
+        pos++;
+
+    *pmsg = &(msg[pos]);
+    return g_strndup(msg, pos);
+}
+
+static gboolean dbc_parse_num(const char** pmsg, double* val)
+{
+    const char* msg = *pmsg;
+    *val = g_ascii_strtod(msg, (char**)&msg);
+
+    if (msg == *pmsg)
+        return FALSE;
+
+    *pmsg = msg;
+    return TRUE;
+}
+
+static int dbc_parse_msg(struct dbc_context* ctx, const char* msg)
+{
+    guint32 orig_msg_id = 0;
+    guint32 msg_id = 0;
+    char* msg_name = NULL;
+    guint32 dlc_val = 0;
+    char* ecu_val = NULL;
+    struct dbc_message* message = NULL;
+
+    ctx->current_msg = NULL;
+
+    if (!ws_strtou32(msg, &msg, &msg_id) || !dbc_skip_sepa(&msg))
+        return -1;
+
+    orig_msg_id = msg_id;
+    msg_id = msg_id & ctx->msg_id_mask;
+
+    message = (struct dbc_message*)g_hash_table_lookup(dbc_msg_ids, GUINT_TO_POINTER(msg_id));
+    if (message)
+        return -2;
+
+    msg_name = dbc_parse_name(&msg);
+    if (!msg_name)
+        goto fail;
+
+    dbc_skip_sepa(&msg);
+
+    if (!dbc_skip_char(&msg, ':'))
+        goto fail;
+
+    dbc_skip_sepa(&msg);
+
+    if (!ws_strtou32(msg, &msg, &dlc_val) || !dbc_skip_sepa(&msg))
+        goto fail;
+
+    ecu_val = dbc_parse_name(&msg);
+    if (!ecu_val)
+        goto fail;
+
+    message = g_new0(struct dbc_message, 1);
+    message->id = msg_id;
+    message->orig_id = orig_msg_id;
+    message->name = msg_name;
+    message->file = ctx->file;
+    message->signals = NULL;
+    message->signal_count = 0;
+    message->hf_id = -1;
+    message->ett_id = -1;
+    message->comment = NULL;
+
+    g_hash_table_insert(dbc_msg_ids, GUINT_TO_POINTER(msg_id), message);
+    ctx->current_msg = message;
+
+    g_free(ecu_val);
+    return 0;
+
+fail:
+    g_free(msg_name);
+    g_free(ecu_val);
+    return -1;
+}
+
+static int dbc_parse_msg_comment(struct dbc_context* ctx, const char* cmt)
+{
+    guint32 msg_id = 0;
+    struct dbc_message* message = NULL;
+
+    dbc_skip_sepa(&cmt);
+
+    if (!ws_strtou32(cmt, &cmt, &msg_id) || !dbc_skip_sepa(&cmt))
+        return -1;
+
+    msg_id = msg_id & ctx->msg_id_mask;
+
+    message = (struct dbc_message*)g_hash_table_lookup(dbc_msg_ids, GUINT_TO_POINTER(msg_id));
+    if (!message || message->comment)
+        return -2;
+
+    message->comment = dbc_parse_str(&cmt);
+    return 0;
+}
+
+static int dbc_parse_sig_comment(struct dbc_context* ctx, const char* cmt)
+{
+    guint32 msg_id = 0;
+    char* sig_name = NULL;
+    struct dbc_message* message = NULL;
+    struct dbc_signal* signall = NULL;
+
+    dbc_skip_sepa(&cmt);
+
+    if (!ws_strtou32(cmt, &cmt, &msg_id) || !dbc_skip_sepa(&cmt))
+        return -1;
+
+    msg_id = msg_id & ctx->msg_id_mask;
+
+    message = (struct dbc_message*)g_hash_table_lookup(dbc_msg_ids, GUINT_TO_POINTER(msg_id));
+    if (!message)
+        return -2;
+
+    sig_name = dbc_parse_name(&cmt);
+    if (!sig_name)
+        return -1;
+
+    dbc_skip_sepa(&cmt);
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        if (!strcmp(signall->name, sig_name))
+            break;
+    }
+
+    if (signall && !signall->comment)
+    {
+        signall->comment = dbc_parse_str(&cmt);
+    }
+
+    g_free(sig_name);
+    return 0;
+}
+
+static int dbc_parse_sig(struct dbc_context* ctx, const char* sig)
+{
+    struct dbc_signal* signall = NULL;
+    struct dbc_signal* signall_ins = NULL;
+    struct dbc_message* message = ctx->current_msg;
+
+    char* sig_name = NULL;
+    guint32 sig_bit_start = 0;
+    guint32 sig_bit_length = 0;
+    guint8 sig_flags = 0;
+    double sig_fac = 0.0;
+    double sig_off = 0.0;
+    double sig_min = 0.0;
+    double sig_max = 0.0;
+    char* sig_unit = NULL;
+
+    if (message == NULL)
+        return -2;
+
+    dbc_skip_sepa(&sig);
+
+    sig_name = dbc_parse_name(&sig);
+    if (!sig_name)
+        goto fail;
+
+    dbc_skip_sepa(&sig);
+
+    if (dbc_skip_char(&sig, 'M'))
+    {
+        // Multiplexor
+    }
+    else if (dbc_skip_char(&sig, 'm'))
+    {
+        guint32 val = 0;
+        (void)ws_strtou32(sig, &sig, &val);
+    }
+
+    dbc_skip_sepa(&sig);
+
+    if (!dbc_skip_char(&sig, ':'))
+        goto fail;
+
+    dbc_skip_sepa(&sig);
+
+    if (!ws_strtou32(sig, &sig, &sig_bit_start))
+        goto fail;
+
+    dbc_skip_sepa(&sig);
+
+    if (!dbc_skip_char(&sig, '|'))
+        goto fail;
+
+    if (!ws_strtou32(sig, &sig, &sig_bit_length))
+        goto fail;
+
+    if (!dbc_skip_char(&sig, '@'))
+        goto fail;
+
+    if (dbc_skip_char(&sig, '0'))
+        sig_flags |= DBC_SIGNAL_MOTOROLA;
+    else if (dbc_skip_char(&sig, '1'))
+        sig_flags |= DBC_SIGNAL_INTEL;
+    else
+        goto fail;
+
+    if (dbc_skip_char(&sig, '+'))
+        sig_flags |= DBC_SIGNAL_UNSIGNED;
+    else if (dbc_skip_char(&sig, '-'))
+        sig_flags |= DBC_SIGNAL_SIGNED;
+    else
+        goto fail;
+
+    dbc_skip_sepa(&sig);
+
+    if (!dbc_skip_char(&sig, '(') ||
+        !dbc_parse_num(&sig, &sig_fac) ||
+        !dbc_skip_char(&sig, ',') ||
+        !dbc_parse_num(&sig, &sig_off) ||
+        !dbc_skip_char(&sig, ')') ||
+        !dbc_skip_sepa(&sig))
+    {
+        goto fail;
+    }
+
+    if (sig_off == 0.0 && sig_fac == 1.0)
+        sig_flags |= DBC_SIGNAL_JUST_BIT;
+
+    if (!dbc_skip_char(&sig, '[') ||
+        !dbc_parse_num(&sig, &sig_min) ||
+        !dbc_skip_char(&sig, '|') ||
+        !dbc_parse_num(&sig, &sig_max) ||
+        !dbc_skip_char(&sig, ']') ||
+        !dbc_skip_sepa(&sig))
+    {
+        goto fail;
+    }
+
+    sig_unit = dbc_parse_str(&sig);
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        if (sig_bit_start > signall->bit_start)
+            signall_ins = signall;
+
+        if (!strcmp(signall->name, sig_name))
+            goto fail;
+    }
+
+    signall = g_new0(struct dbc_signal, 1);
+    signall->name = sig_name;
+    signall->bit_start = (guint8)sig_bit_start;
+    signall->bit_length = (guint8)sig_bit_length;
+    signall->factor = sig_fac;
+    signall->offset = sig_off;
+    signall->min_value = sig_min;
+    signall->max_value = sig_max;
+    signall->flags = sig_flags;
+    signall->unit = sig_unit;
+    signall->comment = NULL;
+    signall->vals = NULL;
+    signall->hf_id = -1;
+    signall->ett_id = -1;
+    signall->next = NULL;
+
+    message->signal_count++;
+
+    if (signall_ins)
+    {
+        signall->next = signall_ins->next;
+        signall_ins->next = signall;
+    }
+    else
+    {
+        signall->next = message->signals;
+        message->signals = signall;
+    }
+
+    return 0;
+
+fail:
+    g_free(sig_name);
+    g_free(sig_unit);
+    return -1;
+}
+
+static int dbc_parse_sig_enum(struct dbc_context* ctx, const char* sig_enum)
+{
+    struct dbc_message* message = NULL;
+    struct dbc_signal* signall = NULL;
+    guint32 msg_id = 0;
+    char* sig_name = NULL;
+    GArray* vals = NULL;
+    value_string val;
+
+    memset(&val, 0, sizeof(val));
+
+    dbc_skip_sepa(&sig_enum);
+
+    if (!ws_strtou32(sig_enum, &sig_enum, &msg_id) || !dbc_skip_sepa(&sig_enum))
+        return -1;
+
+    msg_id = msg_id & ctx->msg_id_mask;
+
+    message = (struct dbc_message*)g_hash_table_lookup(dbc_msg_ids, GUINT_TO_POINTER(msg_id));
+    if (!message)
+        return -2;
+
+    sig_name = dbc_parse_name(&sig_enum);
+    if (!sig_name)
+        return -1;
+
+    dbc_skip_sepa(&sig_enum);
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        if (!strcmp(signall->name, sig_name))
+            break;
+    }
+
+    if (!signall)
+    {
+        g_free(sig_name);
+        return -2;
+    }
+
+    g_free(sig_name);
+
+    if ((signall->flags & DBC_SIGNAL_JUST_BIT) == 0)
+        return -2;
+
+    vals = g_array_new(FALSE, FALSE, sizeof(value_string));
+
+    while (*sig_enum && *sig_enum != ';')
+    {
+        if (!ws_strtou32(sig_enum, &sig_enum, &val.value) || !dbc_skip_sepa(&sig_enum))
+        {
+            g_array_free(vals, TRUE);
+            return -1;
+        }
+
+        val.strptr = dbc_parse_str(&sig_enum);
+        if (!val.strptr)
+        {
+            g_array_free(vals, TRUE);
+            return -1;
+        }
+
+        dbc_skip_sepa(&sig_enum);
+        g_array_append_vals(vals, &val, 1);
+    }
+
+    val.value = 0;
+    val.strptr = NULL;
+    g_array_append_vals(vals, &val, 1);
+
+    signall->vals = (value_string*)g_array_free(vals, FALSE);
+    return 0;
+}
+
+static int dbc_parse_line(struct dbc_context* ctx, const char* line)
+{
+    if (!strncmp(line, "BO_ ", 4))
+    {
+        line += 4;
+        return dbc_parse_msg(ctx, line);
+    }
+
+    if (!strncmp(line, "SG_ ", 4))
+    {
+        line += 4;
+        return dbc_parse_sig(ctx, line);
+    }
+
+    if (!strncmp(line, "VAL_ ", 5))
+    {
+        line += 5;
+        return dbc_parse_sig_enum(ctx, line);
+    }
+
+    if (!strncmp(line, "CM_ BO_ ", 8))
+    {
+        line += 8;
+        return dbc_parse_msg_comment(ctx, line);
+    }
+
+    if (!strncmp(line, "CM_ SG_ ", 8))
+    {
+        line += 8;
+        return dbc_parse_sig_comment(ctx, line);
+    }
+
+    return -1;
+}
+
+static char* dbc_fgets(struct dbc_context* ctx)
+{
+    if ((fgets(ctx->buf, sizeof(ctx->buf), ctx->fp)))
+    {
+        char* ptr = ctx->buf;
+        size_t len = 0;
+
+        dbc_skip_sepa((const char**)&ptr);
+        len = strlen(ptr);
+
+        if (len > 0 && g_ascii_isspace(ptr[len - 1]))
+            len--;
+
+        ptr[len] = '\0';
+        return ptr;
+    }
+
+    return NULL;
+}
+
+static int dbc_read_file(const char* path, int ftype, guint32 mask)
+{
+    struct dbc_context ctx;
+    struct dbc_file* ctx_f = NULL;
+    char* buf = NULL;
+    FILE* fp = NULL;
+
+    if (!path || strlen(path) == 0)
+    {
+        printf("ERROR: Empty path provided to dbc_read_file\n");
+        return -1;
+    }
+
+    // Handle paths with spaces - remove surrounding quotes if present
+    char* clean_path = NULL;
+    if (path[0] == '"' && path[strlen(path) - 1] == '"')
+    {
+        // Remove quotes
+        clean_path = g_strndup(path + 1, strlen(path) - 2);
+    }
+    else
+    {
+        clean_path = g_strdup(path);
+    }
+
+    printf("Attempting to open file: [%s]\n", clean_path);
+
+    fp = fopen(clean_path, "rb");
+    if (!fp)
+    {
+        printf("ERROR: Cannot open file: %s (errno: %d)\n", clean_path, errno);
+        g_free(clean_path);
+        return -1;
+    }
+
+    printf("Successfully opened: %s\n", clean_path);
+
+    ctx_f = g_new0(struct dbc_file, 1);
+    ctx_f->path = clean_path;  // Use clean_path instead of g_strdup(path)
+    ctx_f->ftype = (guint)ftype;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.msg_id_mask = mask;
+    ctx.file = ctx_f;
+    ctx.fp = fp;
+    ctx.current_msg = NULL;
+
+    while ((buf = dbc_fgets(&ctx)))
+    {
+        if (buf[0] == '\0')
+            continue;
+
+        (void)dbc_parse_line(&ctx, buf);
+    }
+
+    fclose(fp);
+    printf("File closed: %s\n", clean_path);
+    return 0;
+}
+
+// Dissector functions
+struct dbc_message* dbc_message_lookup(guint32 can_id)
+{
+    if (!dbc_msg_ids)
+        return NULL;
+
+    return (struct dbc_message*)g_hash_table_lookup(dbc_msg_ids, GUINT_TO_POINTER(can_id));
+}
+
+static inline guint64 dbc_extract_bits(tvbuff_t* tvb, guint bpos, guint align,
+    guint shifter, guint pos)
+{
+    guint64 val = tvb_get_guint8(tvb, bpos / 8);
+    guint mask = (1 << shifter) - 1;
+    return ((val >> align) & mask) << pos;
+}
+
+static guint64 dbc_extract_bits_intel(tvbuff_t* tvb, guint bpos, guint bits)
+{
+    guint pos = 0;
+    guint aligner = 0;
+    guint shifter = 0;
+    guint64 val = 0;
+
+    pos = 0;
+    while (bits > 0)
+    {
+        aligner = bpos % 8;
+        shifter = 8 - aligner;
+        shifter = MIN(shifter, bits);
+
+        val |= dbc_extract_bits(tvb, bpos, aligner, shifter, pos);
+        pos += shifter;
+        bpos += shifter;
+        bits -= shifter;
+    }
+
+    return val;
+}
+
+static guint64 dbc_extract_bits_motorola(tvbuff_t* tvb, guint bpos, guint bits)
+{
+    guint pos = 0;
+    guint aligner = 0;
+    guint slicer = 0;
+    guint64 val = 0;
+
+    pos = bits;
+    while (bits > 0)
+    {
+        slicer = (bpos % 8) + 1;
+        slicer = MIN(slicer, bits);
+        aligner = ((bpos % 8) + 1) - slicer;
+
+        pos -= slicer;
+        val |= dbc_extract_bits(tvb, bpos, aligner, slicer, pos);
+
+        bpos = ((bpos / 8) + 1) * 8 + 7;
+        bits -= slicer;
+    }
+
+    return val;
+}
+
+static void dissect_dbc_message_signal(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree,
+    struct dbc_signal* signall, int sig_number)
+{
+    double val = 0.0;
+    guint64 bits_val = 0;
+    proto_item* ti = NULL;
+    proto_tree* sig_tree = NULL;
+    const char* s_unit = signall->unit;
+    const char* s_vals = "";
+    tvbuff_t* data = NULL;
+
+    data = tvb_new_subset_remaining(tvb, 8);
+
+    bits_val = (signall->flags & DBC_SIGNAL_MOTOROLA) ?
+        dbc_extract_bits_motorola(data, signall->bit_start, signall->bit_length) :
+        dbc_extract_bits_intel(data, signall->bit_start, signall->bit_length);
+
+    if ((signall->flags & DBC_SIGNAL_UNSIGNED) == 0)
+    {
+        bits_val = ws_sign_ext64(bits_val, signall->bit_length);
+        val = signall->offset + signall->factor * ((gint64)bits_val);
+    }
+    else
+    {
+        val = signall->offset + signall->factor * bits_val;
+    }
+
+    if (signall->flags & DBC_SIGNAL_JUST_BIT)
+    {
+        if (signall->bit_length > 32)
+        {
+            if (signall->flags & DBC_SIGNAL_UNSIGNED)
+                ti = proto_tree_add_uint64(tree, signall->hf_id, tvb, 8, 8, bits_val);
+            else
+                ti = proto_tree_add_int64(tree, signall->hf_id, tvb, 8, 8, (gint64)bits_val);
+        }
+        else
+        {
+            if (signall->flags & DBC_SIGNAL_UNSIGNED)
+                ti = proto_tree_add_uint(tree, signall->hf_id, tvb, 8, 8, (guint)bits_val);
+            else
+                ti = proto_tree_add_int(tree, signall->hf_id, tvb, 8, 8, (int)bits_val);
+        }
+
+        if (signall->vals && (bits_val >> 32) == 0)
+            s_vals = val_to_str_const((guint32)bits_val, signall->vals, "");
+    }
+    else
+    {
+        ti = proto_tree_add_double(tree, signall->hf_id, tvb, 8, 8, val);
+    }
+
+    sig_tree = proto_item_add_subtree(ti, signall->ett_id);
+
+    if (val < signall->min_value)
+        proto_tree_add_expert_format(sig_tree, pinfo, &ei_dbc_signal_min, tvb, 8, 8,
+            "WARNING: value (%g) is below MIN (%g)", val, signall->min_value);
+
+    if (val > signall->max_value)
+        proto_tree_add_expert_format(sig_tree, pinfo, &ei_dbc_signal_max, tvb, 8, 8,
+            "WARNING: value (%g) is above MAX (%g)", val, signall->max_value);
+
+    if (!s_unit)
+        s_unit = "";
+
+    if ((signall->flags & DBC_SIGNAL_UNSIGNED) == 0)
+        proto_item_append_text(ti, " %s (%g + %g * %" G_GINT64_FORMAT ")", s_unit, signall->offset, signall->factor, (gint64)bits_val);
+    else
+        proto_item_append_text(ti, " %s (%g + %g * %" G_GUINT64_FORMAT ")", s_unit, signall->offset, signall->factor, bits_val);
+
+    if (sig_number < MAX_SIGNAL)
+    {
+        proto_tree_add_string(sig_tree, hf_dbc_signal_name[sig_number], tvb, 8, 8, signall->name);
+        if (signall->comment)
+            proto_tree_add_string(sig_tree, hf_dbc_signal_comment[sig_number], tvb, 8, 8, signall->comment);
+        proto_tree_add_double(sig_tree, hf_dbc_signal_val[sig_number], tvb, 8, 8, val);
+
+        if (s_unit[0])
+            proto_tree_add_string(sig_tree, hf_dbc_signal_unit[sig_number], tvb, 8, 8, s_unit);
+        else if (s_vals[0])
+            proto_tree_add_string(sig_tree, hf_dbc_signal_unit[sig_number], tvb, 8, 8, s_vals);
+
+        proto_tree_add_double(sig_tree, hf_dbc_signal_val_min[sig_number], tvb, 8, 8, signall->min_value);
+        proto_tree_add_double(sig_tree, hf_dbc_signal_val_max[sig_number], tvb, 8, 8, signall->max_value);
+    }
+}
+
+int dissect_dbc_message(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree, struct dbc_message* message)
+{
+    struct dbc_signal* signall = NULL;
+    int sig_number = 0;
+    proto_tree* msg_tree = NULL;
+    proto_item* ti = NULL;
+
+    col_append_fstr(pinfo->cinfo, COL_INFO, "%s", message->name);
+
+    ti = proto_tree_add_item(tree, message->hf_id, tvb, 0, -1, ENC_NA);
+    msg_tree = proto_item_add_subtree(ti, message->ett_id);
+
+    if (message->file->ftype == DBC_FILE_TYPE_J1939)
+        proto_tree_add_uint(msg_tree, hf_dbc_message_id, tvb, 0, 4, message->id >> 8);
+    else
+        proto_tree_add_uint(msg_tree, hf_dbc_message_id, tvb, 0, 4, message->id);
+
+    proto_tree_add_uint(msg_tree, hf_dbc_message_orig_id, tvb, 0, 4, message->orig_id);
+    proto_tree_add_string(msg_tree, hf_dbc_message_name, tvb, 0, 4, message->name);
+
+    if (message->comment)
+        proto_tree_add_string(msg_tree, hf_dbc_message_comment, tvb, 0, 4, message->comment);
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        dissect_dbc_message_signal(tvb, pinfo, msg_tree, signall, sig_number);
+        sig_number++;
+    }
+
+    return tvb_captured_length(tvb);
+}
+
+static int dissect_dbc(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree, void* data)
+{
+    int id = 0;
+    struct dbc_message* message = NULL;
+    proto_tree* dbc_tree = NULL;
+    proto_item* ti = NULL;
+
+    (void)data;
+
+    col_set_str(pinfo->cinfo, COL_PROTOCOL, "Custom-CAN");
+    col_clear(pinfo->cinfo, COL_INFO);
+
+    if (tvb_captured_length(tvb) < 4)
+        return 0;
+
+    id = (int)tvb_get_uint32(tvb, 0, ENC_BIG_ENDIAN);
+
+    message = dbc_message_lookup((guint32)id);
+    if (!message)
+        return 0;
+
+    ti = proto_tree_add_item(tree, proto_dbc, tvb, 0, -1, ENC_NA);
+    dbc_tree = proto_item_add_subtree(ti, ett_dbc);
+
+    return dissect_dbc_message(tvb, pinfo, dbc_tree, message);
+}
+
+// Register/Deregister functions
+static void dbc_deregister_message(gpointer key _U_, gpointer value, gpointer data _U_)
+{
+    struct dbc_message* message = (struct dbc_message*)value;
+    struct dbc_signal* signall = NULL;
+
+    if (!message)
+        return;
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        if (signall->hf_id != -1)
+        {
+            proto_deregister_field(proto_dbc, signall->hf_id);
+            signall->hf_id = -1;
+        }
+    }
+
+    if (message->hf_id != -1)
+    {
+        proto_deregister_field(proto_dbc, message->hf_id);
+        message->hf_id = -1;
+    }
+}
+
+static char* sanitize_filter_name(const char* name)
+{
+    if (!name || strlen(name) == 0)
+        return g_strdup("unnamed");
+
+    GString* result = g_string_new("");
+    gboolean has_valid_char = FALSE;
+
+    for (const char* p = name; *p; p++)
+    {
+        char c = *p;
+
+        // Only allow: a-z, A-Z, 0-9, underscore, hyphen
+        if (g_ascii_isalnum(c) || c == '_' || c == '-')
+        {
+            g_string_append_c(result, c);
+            has_valid_char = TRUE;
+        }
+        else if (c == ' ' || c == '\t')
+        {
+            // Replace whitespace with underscore
+            if (result->len > 0 && result->str[result->len - 1] != '_')
+            {
+                g_string_append_c(result, '_');
+                has_valid_char = TRUE;
+            }
+        }
+        // All other characters are skipped
+    }
+
+    // Ensure we have at least some valid content
+    if (result->len == 0 || !has_valid_char)
+    {
+        g_string_free(result, TRUE);
+        return g_strdup("unnamed");
+    }
+
+    // Ensure name doesn't start with a number
+    if (g_ascii_isdigit(result->str[0]))
+    {
+        GString* prefixed = g_string_new("msg_");
+        g_string_append(prefixed, result->str);
+        g_string_free(result, TRUE);
+        result = prefixed;
+    }
+
+    return g_string_free(result, FALSE);
+}
+
+static void dbc_register_message(gpointer key _U_, gpointer value, gpointer data _U_)
+{
+    struct dbc_message* message = (struct dbc_message*)value;
+    struct dbc_signal* signall = NULL;
+    char filter_prefix[512];
+    static const hf_register_info sample_hfi =
+    {
+        NULL,
+        {
+            "name",
+            "abbrev",
+            FT_NONE,
+            BASE_NONE,
+            NULL,
+            0x0,
+            "blurb",
+            HFILL
+        }
+    };
+    int* etts[1];
+    hf_register_info* hfi = NULL;
+
+    if (!message)
+        return;
+
+    filter_prefix[0] = '\0';
+
+    if (message->file && message->file->path)
+    {
+        const char* tmp = message->file->path;
+        char* s = NULL;
+
+        s = (char*)strrchr(tmp, '/');
+        if (s)
+            tmp = s + 1;
+        s = (char*)strrchr(tmp, '\\');
+        if (s)
+            tmp = s + 1;
+
+        g_strlcpy(filter_prefix, tmp, sizeof(filter_prefix));
+        s = (char*)strchr(filter_prefix, '.');
+        if (s)
+            *s = '\0';
+    }
+
+    char* clean_prefix = sanitize_filter_name(filter_prefix);
+    char* clean_msg_name = sanitize_filter_name(message->name);
+
+    hfi = (hf_register_info*)g_memdup(&sample_hfi, sizeof(sample_hfi));
+    hfi->p_id = &(message->hf_id);
+    hfi->hfinfo.name = message->name;  // Keep original name for display
+    hfi->hfinfo.abbrev = g_strdup_printf("customcan.%s.%s", clean_prefix, clean_msg_name);  // Use sanitized
+    hfi->hfinfo.blurb = message->comment;
+
+    proto_register_field_array(proto_dbc, hfi, 1);
+
+    etts[0] = &(message->ett_id);
+    proto_register_subtree_array(etts, 1);
+
+    for (signall = message->signals; signall; signall = signall->next)
+    {
+        char* clean_sig_name = sanitize_filter_name(signall->name);
+
+        hfi = (hf_register_info*)g_memdup(&sample_hfi, sizeof(sample_hfi));
+        hfi->p_id = &(signall->hf_id);
+        hfi->hfinfo.name = signall->name;
+        hfi->hfinfo.abbrev = g_strdup_printf("customcan.%s.%s.%s", clean_prefix, clean_msg_name, clean_sig_name);
+        hfi->hfinfo.blurb = signall->comment;
+
+        if (signall->flags & DBC_SIGNAL_JUST_BIT)
+        {
+            guint b = signall->bit_length;
+
+            if (signall->flags & DBC_SIGNAL_UNSIGNED)
+            {
+                hfi->hfinfo.type =
+                    (b < 9) ? FT_UINT8 : (b < 17) ? FT_UINT16 : (b < 25) ? FT_UINT24 :
+                    (b < 33) ? FT_UINT32 : (b < 41) ? FT_UINT40 : (b < 49) ? FT_UINT48 :
+                    (b < 57) ? FT_UINT56 : FT_UINT64;
+
+                if (signall->unit)
+                    hfi->hfinfo.display = BASE_DEC;
+                else
+                    hfi->hfinfo.display = BASE_DEC_HEX;
+            }
+            else
+            {
+                hfi->hfinfo.type =
+                    (b < 9) ? FT_INT8 : (b < 17) ? FT_INT16 : (b < 25) ? FT_INT24 :
+                    (b < 33) ? FT_INT32 : (b < 41) ? FT_INT40 : (b < 49) ? FT_INT48 :
+                    (b < 57) ? FT_INT56 : FT_INT64;
+                hfi->hfinfo.display = BASE_DEC;
+            }
+
+            hfi->hfinfo.strings = signall->vals;
+        }
+        else
+        {
+            hfi->hfinfo.type = FT_DOUBLE;
+        }
+
+        proto_register_field_array(proto_dbc, hfi, 1);
+
+        etts[0] = &(signall->ett_id);
+        proto_register_subtree_array(etts, 1);
+
+        g_free(clean_sig_name);  
+    }
+
+    g_free(clean_prefix);   
+    g_free(clean_msg_name); 
+}
+
+// UAT Callbacks - Use Wireshark macros to auto-generate
+UAT_FILENAME_CB_DEF(dbc_files_uat_data, filename, struct dbc_files_uat_data)
+UAT_CSTRING_CB_DEF(dbc_files_uat_data, channel_name, struct dbc_files_uat_data)
+UAT_DEC_CB_DEF(dbc_files_uat_data, ftype, struct dbc_files_uat_data)
+UAT_BOOL_CB_DEF(dbc_files_uat_data, enabled, struct dbc_files_uat_data)
+
+static void* dbc_files_uat_copy_cb(void* dest, const void* source, size_t len _U_)
+{
+    struct dbc_files_uat_data* d = (struct dbc_files_uat_data*)dest;
+    const struct dbc_files_uat_data* s = (const struct dbc_files_uat_data*)source;
+    d->filename = g_strdup(s->filename);
+    d->channel_name = g_strdup(s->channel_name);
+    d->ftype = s->ftype;
+    d->enabled = s->enabled;
+    return dest;
+}
+
+static void dbc_files_uat_free_cb(void* r)
+{
+    struct dbc_files_uat_data* record = (struct dbc_files_uat_data*)r;
+    g_free(record->filename);
+    g_free(record->channel_name);
+}
+
+static bool dbc_files_uat_data_update_cb(void* record, char** err)
+{
+    struct dbc_files_uat_data* rec = (struct dbc_files_uat_data*)record;
+
+    if (!rec->filename || strlen(rec->filename) == 0)
+    {
+        *err = g_strdup("Filename cannot be empty");
+        return false;
+    }
+
+    // Remove surrounding quotes if present
+    char* clean_path = NULL;
+    if (rec->filename[0] == '"' && rec->filename[strlen(rec->filename) - 1] == '"')
+    {
+        clean_path = g_strndup(rec->filename + 1, strlen(rec->filename) - 2);
+        g_free(rec->filename);
+        rec->filename = clean_path;
+    }
+
+    // Validate file exists
+    FILE* test_fp = fopen(rec->filename, "rb");
+    if (!test_fp)
+    {
+        *err = g_strdup_printf("Cannot open file: %s", rec->filename);
+        return false;
+    }
+    fclose(test_fp);
+
+    *err = NULL;
+    return true;
+}
+
+static void dbc_cleanup_loaded_files(void)
+{
+    if (loaded_dbc_files)
+    {
+        for (guint i = 0; i < loaded_dbc_files->len; i++)
+        {
+            struct dbc_file_entry* entry = &g_array_index(loaded_dbc_files, struct dbc_file_entry, i);
+            g_free(entry->display_name);
+            if (entry->file)
+            {
+                g_free(entry->file->path);
+                g_free(entry->file);
+            }
+        }
+        g_array_free(loaded_dbc_files, TRUE);
+    }
+    loaded_dbc_files = NULL;
+}
+
+static void dbc_files_uat_initialize_cb(void)
+{
+    if (dbc_msg_ids)
+    {
+        g_hash_table_foreach(dbc_msg_ids, dbc_deregister_message, NULL);
+        g_hash_table_destroy(dbc_msg_ids);
+    }
+    dbc_msg_ids = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+    dbc_cleanup_loaded_files();
+    loaded_dbc_files = g_array_new(FALSE, FALSE, sizeof(struct dbc_file_entry));
+
+    if (!dbc_files_uat_data || num_dbc_files_uat_data == 0)
+        return;
+
+    for (guint i = 0; i < num_dbc_files_uat_data && i < 10; i++)
+    {
+        if (!dbc_files_uat_data[i].enabled)
+            continue;
+
+        const char* filename = dbc_files_uat_data[i].filename;
+        const char* channel_name = dbc_files_uat_data[i].channel_name;
+
+        if (!filename || strlen(filename) == 0)
+            continue;
+
+        guint32 mask = (dbc_files_uat_data[i].ftype == DBC_FILE_TYPE_J1939) ? 0x03FFFF00 : 0xFFFFFFFF;
+
+        struct dbc_file_entry entry;
+        memset(&entry, 0, sizeof(entry));
+
+        entry.file = g_new0(struct dbc_file, 1);
+        entry.file->path = g_strdup(filename);
+        entry.file->ftype = dbc_files_uat_data[i].ftype;
+        entry.proto_handle = -1;
+        entry.dissector_handle = NULL;
+
+        if (channel_name && strlen(channel_name) > 0)
+            entry.display_name = g_strdup(channel_name);
+        else
+        {
+            const char* base = strrchr(filename, '/');
+            if (!base)
+                base = strrchr(filename, '\\');
+            base = base ? base + 1 : filename;
+
+            char* name_copy = g_strdup(base);
+            char* dot = strrchr(name_copy, '.');
+            if (dot)
+                *dot = '\0';
+            entry.display_name = name_copy;
+        }
+
+        int msg_count_before = g_hash_table_size(dbc_msg_ids);
+        if (dbc_read_file(filename, (int)dbc_files_uat_data[i].ftype, mask) == 0)
+        {
+            int msg_count_after = g_hash_table_size(dbc_msg_ids);
+            printf("Loaded %d messages from %s\n", msg_count_after - msg_count_before, filename);
+            g_array_append_val(loaded_dbc_files, entry);
+        }
+        else
+        {
+            printf("Failed to load %s\n", filename);
+            g_free(entry.display_name);
+            g_free(entry.file->path);
+            g_free(entry.file);
+        }
+    }
+
+    g_hash_table_foreach(dbc_msg_ids, dbc_register_message, NULL);
+
+    printf("Total DBC channels loaded: %u\n", loaded_dbc_files ? loaded_dbc_files->len : 0);
+    printf("Total messages loaded: %u\n", dbc_msg_ids ? g_hash_table_size(dbc_msg_ids) : 0);
+}
+
+void can_custom_register_protoinfo(void)
+{
+    proto_dbc = proto_register_protocol(
+        "CANCustom",
+        "CAN Custom",
+        "customcan"
+    );
+
+    static gint* p_ett[] = {
+        &ett_dbc
+    };
+
+    proto_register_subtree_array(p_ett, array_length(p_ett));
+
+    module_t* dbc_module = prefs_register_protocol(proto_dbc, dbc_files_uat_initialize_cb);
+
+    static uat_field_t dbc_files_uat_flds[] =
+    {
+        UAT_FLD_FILENAME(dbc_files_uat_data, filename, "DBC File", "Path to DBC file"),
+        UAT_FLD_CSTRING(dbc_files_uat_data, channel_name, "Channel Name", "Friendly name"),
+        UAT_FLD_DEC(dbc_files_uat_data, ftype, "Type", "0=General, 1=J1939"),
+        UAT_FLD_BOOL(dbc_files_uat_data, enabled, "Enabled", "Enable/disable"),
+        UAT_END_FIELDS
+    };
+
+    dbc_files_uat = uat_new("DBC Files",
+        sizeof(struct dbc_files_uat_data),
+        "dbc_files",
+        TRUE,
+        &dbc_files_uat_data,
+        &num_dbc_files_uat_data,
+        UAT_AFFECTS_DISSECTION | UAT_AFFECTS_FIELDS,
+        NULL,
+        dbc_files_uat_copy_cb,
+        dbc_files_uat_data_update_cb,
+        dbc_files_uat_free_cb,
+        dbc_files_uat_initialize_cb,
+        NULL,
+        dbc_files_uat_flds);
+
+    prefs_register_uat_preference(dbc_module, "dbc_files_table",
+        "DBC Files",
+        "Configure multiple DBC files",
+        dbc_files_uat);
+
+    static hf_register_info signal_hf_example[] =
+    {
+        { &hf_dbc_signal_val[0],
+            { "DBC Signal", "dbc.signal_val_", FT_DOUBLE, BASE_NONE, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_signal_unit[0],
+            { "DBC Signal Unit", "dbc.signal_unit_", FT_STRINGZ, BASE_NONE, NULL, 0x0, NULL, HFILL },
+        },
+    };
+
+    static hf_register_info hf[] =
+    {
+        { &hf_dbc_module_name,
+            { "DBC File Name", "customcan.file_name", FT_STRINGZ, BASE_NONE, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_frame_num,
+            { "Frame number", "customcan.frame_num", FT_UINT32, BASE_DEC, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_message_id,
+            { "Message ID (masked)", "customcan.message_id", FT_UINT32, BASE_DEC_HEX, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_message_orig_id,
+            { "Message ID (original from DBC)", "customcan.message_orig_id", FT_UINT32, BASE_DEC_HEX, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_message_name,
+            { "Message Name", "customcan.message_name", FT_STRINGZ, BASE_NONE, NULL, 0x0, NULL, HFILL },
+        },
+        { &hf_dbc_message_comment,
+            { "Message Comment", "customcan.message_comment", FT_STRINGZ, BASE_NONE, NULL, 0x0, NULL, HFILL },
+        },
+    };
+
+    static ei_register_info ei[] = {
+        { &ei_dbc_signal_max, { "customcan.signal_max", PI_SEQUENCE, PI_WARN, "WARNING: value is above MAX", EXPFILL }},
+        { &ei_dbc_signal_min, { "customcan.signal_min", PI_SEQUENCE, PI_WARN, "WARNING: value is below MIN", EXPFILL }},
+    };
+
+    proto_register_field_array(proto_dbc, hf, array_length(hf));
+    expert_register_field_array(expert_register_protocol(proto_dbc), ei, array_length(ei));
+
+    for (int i = 0; i < MAX_SIGNAL; i++)
+    {
+        hf_register_info* signal_hf = NULL;
+
+        hf_dbc_signal_name[i] = -1;
+        hf_dbc_signal_comment[i] = -1;
+        hf_dbc_signal_val[i] = -1;
+        hf_dbc_signal_unit[i] = -1;
+        hf_dbc_signal_val_min[i] = -1;
+        hf_dbc_signal_val_max[i] = -1;
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[0], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_val[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Converted Value #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_val_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[0], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_val_min[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Converted Value Min #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_val_min_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[0], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_val_max[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Converted Value Max #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_val_max_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[1], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_unit[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Unit #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_unit_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[1], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_name[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Name #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_name_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+
+        signal_hf = (hf_register_info*)g_memdup(&signal_hf_example[1], sizeof(*signal_hf));
+        signal_hf->p_id = &hf_dbc_signal_comment[i];
+        signal_hf->hfinfo.name = g_strdup_printf("DBC Signal Comment #%d", i);
+        signal_hf->hfinfo.abbrev = g_strdup_printf("customcan.signal_comment_%d", i);
+        proto_register_field_array(proto_dbc, signal_hf, 1);
+    }
+}
+
+void can_custom_reg_handoff(void)
+{
+    dissector_handle_t main_handle = create_dissector_handle(dissect_dbc, proto_dbc);
+    dissector_add_uint("wtap_encap", WTAP_ENCAP_SOCKETCAN, main_handle);
+    dissector_add_for_decode_as("can.subdissector", main_handle);
+}
